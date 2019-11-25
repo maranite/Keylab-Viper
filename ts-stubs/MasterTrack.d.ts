@@ -1,0 +1,2 @@
+interface MasterTrack extends Track {
+}

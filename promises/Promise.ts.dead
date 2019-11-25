@@ -1,0 +1,250 @@
+namespace _PX {
+
+	function isPromiseLike<T>(x: unknown): x is PromiseLike<T> {
+		return typeof x === "object" && typeof (x as PromiseLike<T>).then === 'function';
+	}
+
+	const enum State { Pending, Fulfilled, Rejected };
+
+	function internalResolver(fulfill?: (value: any) => void, reject?: (reason: any) => void): void { }
+	function noop(): void { }
+
+	/** Fast, robust, type-safe promise implementation. */
+	export class Promise<T> implements PromiseLike<T> {
+		/** Create new Promise.
+		 * Pass a callback that will receive a `resolve()` and `reject()` function to seal the promise's fate.
+		 * @param  resolver Called with resolve and reject functions */
+		constructor(executor: (resolve: (value?: T | PromiseLike<T>) => void, reject: (reason?: any) => void) => void) {
+			this.reject = this.reject.bind(this);
+			this.resolve = this.resolve.bind(this);
+
+			if (executor === internalResolver)
+				return;
+
+			if (typeof executor !== "function")
+				throw new TypeError("Promise resolver is not a function");
+
+			try { executor(this.resolve, this.reject); } catch (e) { this.reject(e); }
+			//host.scheduleTask(() => { try { executor(this.resolve, this.reject); } catch (e) { this.reject(e); } }, 0);
+		}
+
+		/** Attaches callbacks for the resolution and/or rejection of the Promise.
+		 * @param onFulfilled The callback to execute when the Promise is resolved.
+		 * @param onRejected The callback to execute when the Promise is rejected.
+		 * @returns A Promise for the completion of which ever callback is executed. */
+		public then<R1 = T, R2 = never>(
+			onFulfilled?: ((value: T) => R1 | PromiseLike<R1>) | undefined | null,
+			onRejected?: ((reason: any) => R2 | PromiseLike<R2>) | undefined | null
+		): Promise<R1 | R2> {
+
+			// if our current state means that no callback execution will occur, just return this to save allocation of another promise.
+			if (this.state === State.Fulfilled && typeof onFulfilled !== "function" ||
+				this.state === State.Rejected && typeof onRejected !== "function") {
+				return <Promise<any>>this;
+			}
+
+			const next = new Promise<R1 | R2>(internalResolver);
+			const dependency = () => {
+				const callback = this.state === State.Fulfilled ? onFulfilled : onRejected;
+				if (typeof callback !== "function")
+					next.complete(this.result, this.state as State.Fulfilled | State.Rejected);
+				else
+					try { next.resolve(callback(this.result)); } catch (e) { next.reject(e); }
+			}
+
+			if (this.state !== State.Pending)
+				dependency();
+			else if (!this.dependants)
+				this.dependants = dependency;
+			else if (Array.isArray(this.dependants))
+				this.dependants.push(dependency);
+			else
+				this.dependants = [this.dependants, dependency];
+			return next;
+		}
+
+		private result: any;    // Can be fulfillment value or rejection reason
+		private state: State = State.Pending;
+		private dependants?: { (): void } | { (): void }[];
+
+		private resolve(value: T | PromiseLike<T> | undefined) {
+			if (this === value)
+				this.reject(new TypeError("cannot resolve Promise to self"));
+			if (isPromiseLike(value)) {
+				try {
+					value.then(this.resolve, this.reject);
+				} catch (e) {
+					this.reject(e);
+				}
+			} else
+				this.complete(value, State.Fulfilled);
+		}
+
+		/** Rejects this promise.  This method is this bound, and safe to apss as a callback. */
+		private reject(value: any) { this.complete(value, State.Rejected); }
+
+		private complete(value: any, state: State.Fulfilled | State.Rejected) {
+			if (this.state !== State.Pending)
+				return;
+			this.result = value;
+			this.state = state;
+			this.complete = this.resolve = noop;
+			if (this.dependants!) return;
+			if (typeof this.dependants === 'function')
+				host.scheduleTask(this.dependants, 0);
+			else if (Array.isArray(this.dependants)) {
+				const len = this.dependants.length;
+				for (let i = 0; i < len; i++)
+					host.scheduleTask(this.dependants[i], 0);
+			}
+			this.dependants = undefined;
+		}
+
+		get isFulfilled(): boolean { return this.state === State.Fulfilled; }
+		get isRejected(): boolean { return this.state === State.Rejected; }
+		get isPending(): boolean { return this.state === State.Pending; }
+
+		/** Return fulfillment value if fulfilled, otherwise throws an error. */
+		get value(): T {
+			if (this.state !== State.Fulfilled) throw new Error("Promise is not fulfilled");
+			return this.result;
+		}
+
+		/** Return rejection value if rejected, otherwise throws an error.	 */
+		get reason(): any {
+			if (this.state !== State.Rejected)
+				throw new Error("Promise is not rejected");
+			return this.result;
+		}
+
+		/** @return A human-readable representation of the promise and its status. */
+		toString(): string {
+			let state: string;
+			switch (this.state) {
+				case State.Fulfilled: state = "fulfilled"; break;
+				case State.Rejected: state = "rejected"; break;
+				default: state = "pending";
+			}
+			return `[Promise - ${state}]`;
+		}
+
+		/**
+		 * Create a promise that resolves with the same value of this promise, after `ms` milliseconds. 
+		 * The timer will start when the current promise is resolved.
+		 * If the current promise is rejected, the resulting promise is also rejected, without waiting for the timer.
+		 * @param ms Number of milliseconds to wait before resolving
+		 * @return Promise that fulfills `ms` milliseconds after this promise fulfills  */
+		public delay(ms: number): Promise<T> {
+			return this.then((value: T) => {
+				return new Promise<T>((resolve) => {
+					host.scheduleTask(() => resolve(value), ms);
+				});
+			});
+		}
+
+		/**  Catch all errors in case promise is rejected.
+		 * The returned promise is resolved with the output of the callback, so it is possible to re-throw the error, but also to return a 'replacement' value that should be used instead.
+		 * @param onRejected  Callback called with promise's rejection reason if promise is rejected. Callback can return another value or promise for a value.
+		 * @return Promise for original value, or 'replaced' value in case of error */
+		public catch<TResult = never>(onrejected?: ((reason: any) => TResult | PromiseLike<TResult>) | undefined | null): Promise<T | TResult> {
+			return this.then(undefined, onrejected);
+		}
+
+		/** Executes upon completion of the promise, regardless of outcome.
+		 * The returned promise is resolved with the output of the callback, so it is possible to re-throw the error, but also to return a 'replacement' value that should be used instead.
+		 * @param handler  Callback called when promise completes.
+		 * @return A promise which returns this promise's  resolved value */
+		public finally(handler: (result: Promise<T>) => void | PromiseLike<void>): Promise<T> {
+			const runner = () => { handler(this); return this; };
+			return this.then(runner, runner);
+		}
+
+		/** Run either `onFulfilled` or `onRejected` callbacks when the promise is resolved.
+		 * The callback will always be called at most once, and always asynchronously (i.e. some time after e.g. the `resolver` passed to the constructor has resolved the promise).
+		 * @param onFulfilled Optional callback called with promise's fulfillment value if promise is fulfilled.
+		 * @param onRejected  Optional callback called with promise's rejection reason if promise is rejected. */
+		public done<R>(
+			onFulfilled?: ((value: T) => void | PromiseLike<void>) | null | undefined,
+			onRejected?: ((reason: any) => void | PromiseLike<void>) | null | undefined) {
+			this.then(onFulfilled, onRejected);
+		}
+
+		/**Return a promise that resolves to `value` after this promise is fulfilled.
+		 * Returned promise is rejected if this promise is rejected.
+		 * Equivalent to `.then(() => value)`.
+		 * @param value Value or promise for value of returned promise
+		 * @return Promise resolved to value after this promise fulfills */
+		public return<R>(value?: R | PromiseLike<R>): Promise<R> {
+			if (value === undefined)
+				return this.then<any>(noop);
+			return this.then(() => value);
+		}
+
+		/** Return a promise that is rejected with `reason` after this promise is fulfilled.
+		 * If this promise is rejected, returned promise will rejected with that error instead.
+		 * @param reason Error reason to reject returned promise with
+		 * @return Promise rejected with `reason` after this promise fulfills		 */
+		public throw(reason: Error): Promise<T> {
+			return this.then(() => { throw reason });
+		}
+
+
+		/** Return a promise for an array of all resolved input promises (or values).
+		 * If any of the input promises is rejected, the returned promise is rejected with that reason.
+		 * When passing an empty array, the promises is immediately resolved to an empty array.
+		 * @param promises Array of values or promises for them
+		 * @return promise that resolves with array of all resolved values		 */
+		public static all<X>(promises: Array<X | PromiseLike<X>>): Promise<X[]> {
+			return new Promise<X[]>((resolve, reject) => {
+				if (!promises || promises.length === 0) {
+					resolve([]);
+					return;
+				}
+				const result = new Array(promises.length);
+				for (let i = 0; i < promises.length; i++) {
+					let t = promises[i];
+					if (t instanceof Promise)
+						follow(t, i);
+					else
+						result[i] = promises[i];
+				}
+				let remaining = 0;
+				function follow(next: Promise<X>, index: number) {
+					remaining++;
+					next.done(
+						value => {
+							result[index] = value;
+							if (--remaining === 0) resolve(result);
+						},
+						reason => reject(reason)
+					);
+				}
+			});
+		}
+
+		/**
+		 * Return a promise that resolves to the fulfillment or rejection of the first input promise that resolves.
+		 * When passing an empty array, the promise will never resolve.
+		 * @param promises Array of values or promises for them
+		 * @return promise that resolves to first resolved input promise */
+		public static race<X>(...promises: Array<PromiseLike<X>>): Promise<X> {
+			return new Promise<X>((resolve, reject) => {
+				for (const t of promises)
+					t.then(resolve, reject);
+			});
+		}
+
+		/**Create a promise that resolves to the given value (or promise for a value) after `ms` milliseconds. 
+		 * The timer will start when the given value is resolved. If the input value is a rejected promise, 
+		 * the resulting promise is also rejected, without waiting for the timer.
+		 * @param value Value or promise for value to be delayed
+		 * @param ms Number of milliseconds to wait before resolving
+		 * @return Promise that fulfills `ms` milliseconds after given (promise for) value is fulfilled		 */
+		public static delay<R>(value: R | PromiseLike<R>, ms: number): Promise<R> {
+			return new Promise<R>((resolve) => { host.scheduleTask(() => resolve(value), ms); });
+		}
+	}
+}
+
+
+class Promise<T> extends _PX.Promise<T> { }
